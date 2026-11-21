@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
-"""Saturday 21 November 2026, in one image.
+"""Draw Saturday 21 November 2026 as a one-page newspaper front page.
 
-A program that draws a newspaper front page summing up the world's news of
-Saturday 21 November 2026 and writes it to /output/entry.png (or
-$MAKEFUN_OUTPUT_DIR/entry.png when that is set, for local runs).
+Pure standard library. No network, no clock, no randomness: the same
+command always produces the same bytes. The glyph bitmaps and the world
+land mask come from the sibling modules fonts and worldmap.
 
-Pure standard library: no network, no files read at run time, no clock, no
-randomness. Two runs write the same bytes. The picture is 1024x1024 RGB and
-under 1 MiB.
-
-Every story on the page happened, or was first reported, on Saturday
-21 November 2026, as reported that day by OneTurn, SCMP, AP, BBC, Reuters
-and the outlets they cite. The count in the top bar is the count of stories
-the page actually lists: 3 hero stories, 8 mid stories, 31 more below.
-Deliberately left out: the Shenzhen summit, the Kyiv strikes and the ICJ
-Myanmar ruling -- all 20 November news, covered in the previous day's page.
-
-Type is drawn from glyph bitmaps embedded in fonts.py (DejaVu, extracted
-from the system fonts on the build machine); the dotted world map comes
-from the land mask in worldmap.py. Nothing else is embedded.
+Layout: a black top bar, a big serif masthead, a UTC timeline strip,
+three hero stories with drawn art panels, eight mid stories in two rows,
+then a bottom band with a dotted world map, a date-check note and a
+31-item "also on Saturday" list, and a sources footer.
 """
 
 import base64
@@ -29,705 +19,678 @@ import struct
 import sys
 import zlib
 
-# The grader runs `python3 -P -s main.py`, and -P keeps the script's own
-# directory off sys.path, so plain `from fonts import ...` fails there.
-# Put this file's directory first so the sibling modules load.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fonts import FONTS
-from worldmap import MAP_BITS, MAP_H, MAP_W
+import fonts
+import worldmap
 
-W, H = 1024, 1024
+WIDTH = 1024
+HEIGHT = 1024
+LEFT = 26
+RIGHT = 998
 
 PAPER = (247, 243, 232)
 INK = (17, 17, 17)
-RED = (176, 42, 32)
-BLUE = (31, 78, 121)
-NAVY = (16, 28, 46)
-GOLD = (176, 132, 32)
 GREY = (96, 92, 82)
-FAINT = (232, 226, 210)
-CREAM = (238, 231, 214)
-WHITE = (255, 255, 255)
-SKY = (31, 58, 95)
-STONE = (120, 110, 92)
+RED = (176, 42, 32)
 GREEN = (46, 110, 58)
+BLUE = (31, 78, 121)
+GOLD = (176, 132, 32)
 PURPLE = (90, 60, 120)
 BROWN = (150, 90, 40)
 TEAL = (0, 120, 120)
+NAVY = (16, 28, 46)
+GRID = (40, 52, 74)
+STEEL = (90, 120, 160)
+BARRED = (200, 60, 44)
+LINECOL = (255, 220, 120)
+PINKRED = (255, 120, 100)
+BEIGE = (226, 214, 188)
+DARKBAR = (60, 52, 40)
+NIGHT = (14, 14, 24)
+SKY = (52, 48, 66)
+BLUEGREY = (31, 58, 95)
+ORANGE = (255, 150, 40)
+MOON = (240, 190, 130)
+WINDOW = (255, 220, 160)
+WIN2 = (240, 190, 110)
+LAND = (150, 140, 115)
+WHITE = (255, 255, 255)
 
-
-# ---------------------------------------------------------------- fonts
-
-def _decode_font(blob):
-    data = json.loads(zlib.decompress(base64.b64decode(blob)))
-    glyphs = {}
-    for ch, g in data["glyphs"].items():
-        if "px" not in g:
-            glyphs[ch] = {"adv": g["adv"]}
-            continue
-        raw = base64.b64decode(g["px"])
-        alpha = bytearray(g["w"] * g["h"])
-        for i in range(g["w"] * g["h"]):
-            byte = raw[i // 2]
-            alpha[i] = (byte >> 4) if i % 2 == 0 else (byte & 15)
-        glyphs[ch] = {
-            "adv": g["adv"], "w": g["w"], "h": g["h"],
-            "x0": g["x0"], "y0": g["y0"], "alpha": bytes(alpha),
-        }
-    return {"ascent": data["ascent"], "descent": data["descent"],
-            "size": data["size"], "glyphs": glyphs}
-
-
-FONTS_D = {name: _decode_font(blob) for name, blob in FONTS.items()}
-
-
-def text_width(font_name, text, tracking=0):
-    font = FONTS_D[font_name]
-    total = 0
-    for ch in text:
-        g = font["glyphs"].get(ch)
-        total += (g["adv"] if g else font["size"] // 2) + tracking
-    return total - tracking if text else 0
-
-
-def wrap_text(font_name, text, max_w, tracking=0):
-    """Greedy word wrap. Returns a list of lines that fit max_w."""
-    words = text.split(" ")
-    lines, cur = [], ""
-    for word in words:
-        trial = word if not cur else cur + " " + word
-        if text_width(font_name, trial, tracking) <= max_w or not cur:
-            cur = trial
-        else:
-            lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-# ---------------------------------------------------------------- canvas
 
 class Canvas:
-    def __init__(self, w, h, bg):
-        self.w, self.h = w, h
-        self.px = bytearray(w * h * 3)
-        self.fill_rect(0, 0, w, h, bg)
+    """A 1024x1024 RGB raster with a few drawing primitives."""
 
-    def _idx(self, x, y):
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(bytes(bg) * (w * h))
+
+    def _pos(self, x, y):
         return (y * self.w + x) * 3
 
-    def set(self, x, y, color):
+    def blend(self, x, y, rgb, alpha):
+        """Blend one pixel over the paper; alpha 0..255."""
+        if alpha <= 0 or x < 0 or y < 0 or x >= self.w or y >= self.h:
+            return
+        i = self._pos(x, y)
+        if alpha >= 255:
+            self.buf[i] = rgb[0]
+            self.buf[i + 1] = rgb[1]
+            self.buf[i + 2] = rgb[2]
+        else:
+            inv = 255 - alpha
+            self.buf[i] = (rgb[0] * alpha + self.buf[i] * inv) // 255
+            self.buf[i + 1] = (rgb[1] * alpha + self.buf[i + 1] * inv) // 255
+            self.buf[i + 2] = (rgb[2] * alpha + self.buf[i + 2] * inv) // 255
+
+    def put(self, x, y, rgb):
         if 0 <= x < self.w and 0 <= y < self.h:
-            i = self._idx(x, y)
-            self.px[i], self.px[i + 1], self.px[i + 2] = color
+            i = self._pos(x, y)
+            self.buf[i] = rgb[0]
+            self.buf[i + 1] = rgb[1]
+            self.buf[i + 2] = rgb[2]
 
-    def blend(self, x, y, color, a15):
-        """Blend color over the pixel with alpha a15 (0..15)."""
-        if a15 <= 0 or not (0 <= x < self.w and 0 <= y < self.h):
+    def fill(self, x0, y0, x1, y1, rgb):
+        """Fill rectangle; x1/y1 exclusive; clipped to the canvas."""
+        x0 = max(0, x0)
+        y0 = max(0, y0)
+        x1 = min(self.w, x1)
+        y1 = min(self.h, y1)
+        if x0 >= x1 or y0 >= y1:
             return
-        i = self._idx(x, y)
-        if a15 >= 15:
-            self.px[i], self.px[i + 1], self.px[i + 2] = color
+        row = bytes(rgb) * (x1 - x0)
+        for y in range(y0, y1):
+            i = self._pos(x0, y)
+            self.buf[i:i + len(row)] = row
+
+    def frame(self, x0, y0, x1, y1, rgb, thick=1):
+        self.fill(x0, y0, x1, y0 + thick, rgb)
+        self.fill(x0, y1 - thick, x1, y1, rgb)
+        self.fill(x0, y0, x0 + thick, y1, rgb)
+        self.fill(x1 - thick, y0, x1, y1, rgb)
+
+    def disc(self, cx, cy, r, rgb):
+        """Filled circle of radius r (floats allowed)."""
+        r2 = r * r
+        ri = int(math.ceil(r))
+        for dy in range(-ri, ri + 1):
+            dx = int(math.sqrt(max(0.0, r2 - dy * dy)))
+            self.fill(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, rgb)
+
+    def ring(self, cx, cy, r_out, r_in, rgb):
+        """Annulus: r_in <= distance <= r_out."""
+        ri = int(math.ceil(r_out))
+        for dy in range(-ri, ri + 1):
+            for dx in range(-ri, ri + 1):
+                d2 = dx * dx + dy * dy
+                if r_in * r_in <= d2 <= r_out * r_out:
+                    self.put(cx + dx, cy + dy, rgb)
+
+    def ellipse(self, cx, cy, rx, ry, rgb):
+        for dy in range(-ry, ry + 1):
+            dx = int(rx * math.sqrt(max(0.0, 1.0 - (dy * dy) / float(ry * ry))))
+            self.fill(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, rgb)
+
+    def ellipse_rot(self, cx, cy, rx, ry, angle_deg, rgb):
+        """Filled ellipse rotated by angle_deg (clockwise in screen space)."""
+        a = math.radians(angle_deg)
+        ca, sa = math.cos(a), math.sin(a)
+        r = max(rx, ry)
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                u = dx * ca - dy * sa
+                v = dx * sa + dy * ca
+                if (u * u) / float(rx * rx) + (v * v) / float(ry * ry) <= 1.0:
+                    self.put(cx + dx, cy + dy, rgb)
+
+    def thick_line(self, x0, y0, x1, y1, rgb, width):
+        """A line of the given width, drawn as stamped discs."""
+        dx, dy = x1 - x0, y1 - y0
+        steps = max(abs(dx), abs(dy), 1)
+        rad = max(1, width // 2)
+        for i in range(steps + 1):
+            t = i / float(steps)
+            x = int(round(x0 + dx * t))
+            y = int(round(y0 + dy * t))
+            self.disc(x, y, rad, rgb)
+
+    def polyline(self, points, rgb, width):
+        for (x0, y0), (x1, y1) in zip(points, points[1:]):
+            self.thick_line(x0, y0, x1, y1, rgb, width)
+
+    def thick_segment(self, x0, y0, x1, y1, rgb, width):
+        """One straight segment of exact perpendicular width, as a quad."""
+        dx, dy = x1 - x0, y1 - y0
+        length = math.hypot(dx, dy)
+        if length == 0:
+            self.disc(x0, y0, width / 2.0, rgb)
             return
-        for k in range(3):
-            self.px[i + k] = (self.px[i + k] * (15 - a15) + color[k] * a15) // 15
+        ox = -dy / length * width / 2.0
+        oy = dx / length * width / 2.0
+        self.polygon([(round(x0 + ox), round(y0 + oy)),
+                      (round(x1 + ox), round(y1 + oy)),
+                      (round(x1 - ox), round(y1 - oy)),
+                      (round(x0 - ox), round(y0 - oy))], rgb)
 
-    def fill_rect(self, x, y, w, h, color):
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.w, x + w), min(self.h, y + h)
-        for yy in range(y0, y1):
-            i = self._idx(x0, yy)
-            for xx in range(x0, x1):
-                self.px[i], self.px[i + 1], self.px[i + 2] = color
-                i += 3
-
-    def frame(self, x, y, w, h, color, t=1):
-        self.fill_rect(x, y, w, t, color)
-        self.fill_rect(x, y + h - t, w, t, color)
-        self.fill_rect(x, y, t, h, color)
-        self.fill_rect(x + w - t, y, t, h, color)
-
-    def hline(self, x, y, w, color, t=1):
-        self.fill_rect(x, y, w, t, color)
-
-    def vline(self, x, y, h, color, t=1):
-        self.fill_rect(x, y, t, h, color)
-
-    def line(self, x0, y0, x1, y1, color, t=1):
-        """Bresenham line, thickness t (square brush)."""
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        x, y = x0, y0
-        r = t // 2
-        while True:
-            self.fill_rect(x - r, y - r, t, t, color)
-            if x == x1 and y == y1:
-                break
-            e2 = 2 * err
-            if e2 >= dy:
-                err += dy
-                x += sx
-            if e2 <= dx:
-                err += dx
-                y += sy
-
-    def disc(self, cx, cy, r, color):
-        for yy in range(cy - r, cy + r + 1):
-            dx = int((r * r - (yy - cy) * (yy - cy)) ** 0.5) if abs(yy - cy) <= r else 0
-            self.fill_rect(cx - dx, yy, 2 * dx + 1, 1, color)
-
-    def ring(self, cx, cy, r, color, t=2):
-        for yy in range(cy - r - 1, cy + r + 2):
-            for xx in range(cx - r - 1, cx + r + 2):
-                d = ((xx - cx) ** 2 + (yy - cy) ** 2) ** 0.5
-                if abs(d - r) <= t / 2.0:
-                    self.set(xx, yy, color)
-
-    def polygon(self, points, color):
-        """Scanline fill of a simple polygon (list of (x, y))."""
+    def polygon(self, points, rgb):
+        """Scanline fill of a simple polygon."""
         if len(points) < 3:
             return
         ys = [p[1] for p in points]
-        for yy in range(max(0, min(ys)), min(self.h, max(ys) + 1)):
-            nodes = []
+        for y in range(min(ys), max(ys) + 1):
+            xs = []
             n = len(points)
             for i in range(n):
                 x0, y0 = points[i]
                 x1, y1 = points[(i + 1) % n]
-                if (y0 <= yy < y1) or (y1 <= yy < y0):
-                    nodes.append(x0 + (yy - y0) * (x1 - x0) / (y1 - y0))
-            nodes.sort()
-            for i in range(0, len(nodes) - 1, 2):
-                xa, xb = int(nodes[i]), int(nodes[i + 1])
-                self.fill_rect(xa, yy, xb - xa + 1, 1, color)
+                if y0 == y1:
+                    continue
+                if (y0 <= y < y1) or (y1 <= y < y0):
+                    t = (y - y0) / float(y1 - y0)
+                    xs.append(x0 + t * (x1 - x0))
+            xs.sort()
+            for i in range(0, len(xs) - 1, 2):
+                self.fill(int(math.ceil(xs[i])), y,
+                          int(math.floor(xs[i + 1])) + 1, y + 1, rgb)
 
-    def ellipse(self, cx, cy, rx, ry, color):
+    def star(self, cx, cy, r_out, r_in, points, rgb, rotation=-90.0):
+        """Star with `points` spikes; rotation in degrees, -90 = up."""
         pts = []
-        steps = 48
-        for i in range(steps):
-            a = 2 * math.pi * i / steps
-            pts.append((int(cx + rx * math.cos(a)),
-                        int(cy + ry * math.sin(a))))
-        self.polygon(pts, color)
+        for i in range(points * 2):
+            ang = math.radians(rotation + i * 180.0 / points)
+            r = r_out if i % 2 == 0 else r_in
+            pts.append((cx + int(round(r * math.cos(ang))),
+                        cy + int(round(r * math.sin(ang)))))
+        self.polygon(pts, rgb)
 
-    # ------------------------------------------------------------ text
+    def png(self):
+        """Encode the buffer as a PNG (truecolour, no filtering)."""
+        raw = bytearray()
+        stride = self.w * 3
+        for y in range(self.h):
+            raw.append(0)
+            raw += self.buf[y * stride:(y + 1) * stride]
 
-    def draw_text(self, font_name, x, y_top, text, color, align="left",
-                  tracking=0):
-        """Draw text with its ascender line at y_top. Returns width drawn."""
-        font = FONTS_D[font_name]
-        width = text_width(font_name, text, tracking)
-        if align == "center":
-            x -= width // 2
-        elif align == "right":
-            x -= width
-        cx = x
-        for ch in text:
-            g = font["glyphs"].get(ch)
-            if g is None:
-                g = font["glyphs"].get("?")
-            if g is None:
-                cx += font["size"] // 2 + tracking
-                continue
-            if "alpha" in g:
-                for row in range(g["h"]):
-                    base = row * g["w"]
-                    for col in range(g["w"]):
-                        a = g["alpha"][base + col]
-                        if a:
-                            self.blend(cx + g["x0"] + col, y_top + g["y0"] + row,
-                                       color, a)
-            cx += g["adv"] + tracking
-        return width
+        def chunk(kind, data):
+            return (struct.pack(">I", len(data)) + kind + data +
+                    struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
 
-    def draw_wrapped(self, font_name, x, y_top, text, color, max_w,
-                     leading=None, tracking=0):
-        """Draw wrapped text; returns the y just below the last line.
-        A newline in the text forces a line break."""
-        font = FONTS_D[font_name]
-        lh = leading if leading is not None else int(font["size"] * 1.18)
-        y = y_top
-        for part in text.split("\n"):
-            for line in wrap_text(font_name, part, max_w, tracking):
-                self.draw_text(font_name, x, y, line, color, tracking=tracking)
-                y += lh
-        return y
+        ihdr = struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
+                chunk(b"IDAT", zlib.compress(bytes(raw), 9)) +
+                chunk(b"IEND", b""))
 
 
-def write_png(path, canvas):
-    """Deterministic RGB PNG: fixed filter 0, zlib level 9, one IDAT."""
-    w, h = canvas.w, canvas.h
-    raw = bytearray()
-    stride = w * 3
-    for y in range(h):
-        raw.append(0)
-        raw += canvas.px[y * stride:(y + 1) * stride]
-    comp = zlib.compress(bytes(raw), 9)
+# ---------------------------------------------------------------- fonts ---
 
-    def chunk(tag, data):
-        out = struct.pack(">I", len(data)) + tag + data
-        out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        return out
-
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp)
-    png += chunk(b"IEND", b"")
-    with open(path, "wb") as f:
-        f.write(png)
-    return len(png)
-
-# ---------------------------------------------------------------- illustrations
-
-def draw_star(c, cx, cy, r, color):
-    pts = []
-    for i in range(10):
-        ang = -math.pi / 2 + i * math.pi / 5
-        rr = r if i % 2 == 0 else r * 0.42
-        pts.append((int(cx + rr * math.cos(ang)), int(cy + rr * math.sin(ang))))
-    c.polygon(pts, color)
+_FONT_CACHE = {}
 
 
-def hero_markets(c, x, y, w, h):
-    """Falling market bars and a plunging red line."""
-    c.fill_rect(x, y, w, h, NAVY)
-    # faint grid
-    for gy in range(y + 18, y + h - 6, 18):
-        c.hline(x + 8, gy, w - 16, (40, 52, 74), 1)
-    bars = [86, 78, 70, 58, 66, 48, 38, 26]
-    bw = (w - 24) // len(bars)
-    for i, bh in enumerate(bars):
-        bx = x + 12 + i * bw
-        col = (200, 60, 44) if i >= 5 else (90, 120, 160)
-        c.fill_rect(bx, y + h - 10 - bh, bw - 6, bh, col)
-    # plunging line over the bars
-    pts = [(x + 12 + i * bw + (bw - 6) // 2, y + h - 14 - bh)
-           for i, bh in enumerate(bars)]
-    for a, b in zip(pts, pts[1:]):
-        c.line(a[0], a[1], b[0], b[1], (255, 220, 120), 3)
-    c.disc(pts[-1][0], pts[-1][1], 5, (255, 220, 120))
-    c.draw_text("serif_bold_26", x + 14, y + 8, "-3.7%", (255, 120, 100))
+def _load_font(name):
+    if name in _FONT_CACHE:
+        return _FONT_CACHE[name]
+    raw = json.loads(zlib.decompress(base64.b64decode(fonts.FONTS[name])))
+    glyphs = {}
+    for ch, g in raw["glyphs"].items():
+        px = base64.b64decode(g["px"]) if "px" in g else b""
+        nib = []
+        for b in px:
+            nib.append(b >> 4)
+            nib.append(b & 15)
+        glyphs[ch] = {"adv": g["adv"], "w": g.get("w", 0), "h": g.get("h", 0),
+                      "x0": g.get("x0", 0), "y0": g.get("y0", 0), "nib": nib}
+    font = {"ascent": raw["ascent"], "descent": raw["descent"],
+            "glyphs": glyphs}
+    _FONT_CACHE[name] = font
+    return font
 
 
-def hero_cartel(c, x, y, w, h):
-    """Wanted poster: star badge over jail bars."""
-    c.fill_rect(x, y, w, h, (226, 214, 188))
-    c.frame(x + 8, y + 8, w - 16, h - 16, INK, 2)
+def text_width(font_name, text, tracking=0):
+    """Advance width of a string; the middle dot uses the '.' advance."""
+    f = _load_font(font_name)
+    g = f["glyphs"]
+    total = 0
+    for ch in text:
+        if ch == "\u00b7":
+            ch = "."
+        gl = g.get(ch)
+        if gl is not None:
+            total += gl["adv"]
+    return total + tracking * max(0, len(text) - 1)
+
+
+def draw_text(cv, x, baseline, font_name, text, color, tracking=0):
+    """Draw text with the pen starting at x; returns the end x."""
+    f = _load_font(font_name)
+    g = f["glyphs"]
+    pen = x
+    for ch in text:
+        if ch == "\u00b7":
+            # Middle dot: a small filled dot floating above the baseline.
+            dot = g["."]
+            cy = baseline - 6
+            cv.disc(pen + dot["adv"] // 2, cy, 2, color)
+            pen += dot["adv"] + tracking
+            continue
+        gl = g.get(ch)
+        if gl is None:
+            continue
+        w, h = gl["w"], gl["h"]
+        if w and h:
+            nib = gl["nib"]
+            top = baseline - f["ascent"] + gl["y0"]
+            left = pen + gl["x0"]
+            for row in range(h):
+                base = row * w
+                yy = top + row
+                if yy < 0 or yy >= HEIGHT:
+                    continue
+                for col in range(w):
+                    v = nib[base + col]
+                    if v:
+                        cv.blend(left + col, yy, color, v * 17)
+        pen += gl["adv"] + tracking
+    return pen
+
+
+def draw_bold_text(cv, x, baseline, font_name, text, color, tracking=0):
+    """Fake bold: draw the text twice, one pixel apart; returns end x."""
+    draw_text(cv, x, baseline, font_name, text, color, tracking)
+    return draw_text(cv, x + 1, baseline, font_name, text, color, tracking)
+
+
+def wrap_lines(font_name, text, max_width, tracking=0):
+    """Greedy word wrap; returns a list of line strings."""
+    lines = []
+    current = ""
+    for word in text.split(" "):
+        trial = word if not current else current + " " + word
+        if text_width(font_name, trial, tracking) <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
+
+
+# ----------------------------------------------------------------- map ----
+
+def land_cells():
+    """Decode the bit-packed land mask into a set of (col, row).
+
+    Bits are packed LSB-first within each byte: bit i of the stream is
+    (byte[i // 8] >> (i % 8)) & 1, where i = row * MAP_W + col.
+    """
+    raw = base64.b64decode(worldmap.MAP_BITS)
+    land = set()
+    for row in range(worldmap.MAP_H):
+        for col in range(worldmap.MAP_W):
+            i = row * worldmap.MAP_W + col
+            if (raw[i // 8] >> (i % 8)) & 1:
+                land.add((col, row))
+    return land
+
+
+def draw_map(cv, land):
+    """Dotted world map in the bottom-left box, with story dots."""
+    cv.frame(22, 728, 360, 856, INK, 1)
+    cell_w = 332.0 / worldmap.MAP_W
+    cell_h = 121.0 / worldmap.MAP_H
+    for (col, row) in land:
+        x0 = math.floor(25 + col * cell_w)
+        x1 = math.ceil(25 + (col + 1) * cell_w)
+        y0 = math.floor(732 + row * cell_h)
+        y1 = math.ceil(732 + (row + 1) * cell_h)
+        cv.fill(x0, y0, x1, y1, LAND)
+    dots = [(91, 781, RED, 8), (123, 768, BLUE, 7), (147, 816, BROWN, 7),
+            (193, 760, PURPLE, 7), (196, 763, GOLD, 7), (221, 762, RED, 8),
+            (232, 781, RED, 8), (244, 781, RED, 8), (319, 772, GOLD, 7),
+            (323, 834, TEAL, 7)]
+    for (cx, cy, color, r_out) in dots:
+        cv.ring(cx, cy, r_out, 4, color)
+        cv.disc(cx, cy, 3, color)
+
+
+# ------------------------------------------------------------ hero art ----
+
+def art_markets(cv, x):
+    """Falling bar chart with a yellow trend line and a red -3.7%."""
+    cv.fill(x, 188, x + 300, 292, NAVY)
+    for gy in (206, 224, 242, 260, 278):
+        cv.fill(x + 1, gy, x + 299, gy + 1, GRID)
+    tops = [196, 205, 212, 224, 216, 234, 244, 258]
+    for i, top in enumerate(tops):
+        bx = x + 12 + i * 34
+        cv.fill(bx, top, bx + 28, 282, STEEL if i < 5 else BARRED)
+    line = [(x + 25, 192), (x + 45, 196), (x + 65, 200), (x + 92, 207),
+            (x + 112, 213), (x + 126, 218), (x + 152, 214), (x + 169, 215),
+            (x + 184, 223), (x + 199, 231), (x + 214, 235), (x + 232, 240),
+            (x + 252, 247)]
+    for (x0, y0), (x1, y1) in zip(line, line[1:]):
+        cv.thick_segment(x0, y0, x1, y1, LINECOL, 4)
+    cv.disc(x + 259, 250, 5, LINECOL)
+    draw_text(cv, x + 14, 221, "serif_bold_26", "-3.7%", PINKRED)
+    cv.frame(x, 188, x + 300, 292, INK, 1)
+
+
+def art_wanted(cv, x):
+    """Wanted-poster: beige card, mugshot bars, gold star, WANTED."""
+    cv.fill(x, 188, x + 300, 292, BEIGE)
+    cv.frame(x, 188, x + 300, 292, INK, 1)
     for i in range(7):
         bx = x + 26 + i * 38
-        c.fill_rect(bx, y + 14, 8, h - 28, (60, 52, 40))
-    draw_star(c, x + w // 2, y + h // 2 - 6, 30, GOLD)
-    c.disc(x + w // 2, y + h // 2 - 6, 11, (226, 214, 188))
-    c.disc(x + w // 2, y + h // 2 - 6, 5, GOLD)
-    c.draw_text("sans_bold_13", x + w // 2, y + h - 26, "WANTED",
-                INK, align="center")
+        cv.fill(bx, 202, bx + 8, 278, DARKBAR)
+    cx, cy = x + 149, 234
+    cv.star(cx, cy, 30, 13, 5, GOLD)
+    cv.disc(cx, cy, 11, BEIGE)
+    cv.disc(cx, cy, 5, GOLD)
+    word = "WANTED"
+    wx = cx - text_width("sans_bold_13", word) // 2 + 1
+    draw_text(cv, wx, 279, "sans_bold_13", word, INK)
+    # Inner frame: top and left 2px, bottom and right 1px.
+    cv.fill(x + 8, 196, x + 292, 198, INK)
+    cv.fill(x + 8, 283, x + 292, 284, INK)
+    cv.fill(x + 8, 196, x + 10, 284, INK)
+    cv.fill(x + 291, 196, x + 292, 284, INK)
 
 
-def hero_kryvyi(c, x, y, w, h):
-    """Dawn skyline, missile arc, blasts over a river city."""
-    c.fill_rect(x, y, w, h, (52, 48, 66))
-    c.disc(x + w - 30, y + 22, 13, (240, 190, 130))
-    for sx, sy in ((24, 18), (80, 30), (150, 14), (210, 26), (268, 20)):
-        c.disc(x + sx, y + sy, 1, WHITE)
-    for bx, bw, bh in ((0, 40, 34), (44, 28, 52), (76, 48, 30), (128, 30, 58),
-                       (162, 42, 38), (208, 34, 50), (246, 40, 32)):
-        c.fill_rect(x + bx, y + h - 22 - bh, bw, bh + 22, (14, 14, 24))
-        for wy in range(y + h - 16 - bh, y + h - 24, 10):
-            for wx in range(x + bx + 5, x + bx + bw - 3, 10):
-                c.fill_rect(wx, wy, 2, 3, (240, 190, 110))
-    # missile arc with smoke trail
-    c.line(x + 30, y + 96, x + 120, y + 44, (255, 220, 160), 2)
-    c.line(x + 120, y + 44, x + 196, y + 66, (255, 220, 160), 2)
-    c.disc(x + 196, y + 66, 4, WHITE)
-    for bx, by, r in ((120, 44, 22), (232, 58, 26)):
-        burst = []
-        for i in range(16):
-            ang = i * math.pi / 8
-            rr = r if i % 2 == 0 else r * 0.45
-            burst.append((int(x + bx + rr * math.cos(ang)),
-                          int(y + by + rr * math.sin(ang))))
-        c.polygon(burst, (255, 150, 40))
-        c.disc(x + bx, y + by, 6, (255, 220, 120))
-    # river at the bottom
-    c.fill_rect(x, y + h - 14, w, 14, (31, 58, 95))
+def art_skyline(cv, x):
+    """Night skyline, missile arc and two orange bursts over the city."""
+    cv.fill(x, 188, x + 300, 292, SKY)
+    # Seven dark towers; window grids are 2x3 warm panes, first row at
+    # top+6, pitch 10, last row no lower than y=267.
+    buildings = [
+        (1, 39, 236, [5, 15, 25, 35]),
+        (47, 25, 218, [49, 59]),
+        (76, 48, 240, [81, 91, 101, 111]),
+        (128, 30, 212, [133, 143, 153]),
+        (162, 42, 232, [167, 177, 187, 197]),
+        (208, 34, 220, [213, 223, 233]),
+        (246, 40, 238, [251, 261, 271, 281]),
+    ]
+    for (bx, bw, top, cols) in buildings:
+        cv.fill(x + bx, top, x + bx + bw, 280, NIGHT)
+        wy = top + 6
+        while wy <= 267:
+            for wx in cols:
+                cv.fill(x + wx, wy, x + wx + 2, wy + 3, WIN2)
+            wy += 10
+    cv.fill(x, 280, x + 300, 292, BLUEGREY)
+    for (sx, sy) in [(24, 206), (80, 218), (150, 202), (210, 214)]:
+        cv.fill(x + sx - 1, sy, x + sx + 2, sy + 1, WHITE)
+        cv.fill(x + sx, sy - 1, x + sx + 1, sy + 2, WHITE)
+    cv.star(x + 120, 232, 22, 11, 8, ORANGE, rotation=0.0)
+    cv.star(x + 232, 246, 26, 13, 8, ORANGE, rotation=0.0)
+    cv.thick_segment(x + 40, 277, x + 120, 232, WINDOW, 2)
+    cv.thick_segment(x + 120, 232, x + 196, 254, WINDOW, 2)
+    cv.disc(x + 120, 232, 6, LINECOL)
+    cv.disc(x + 232, 246, 6, LINECOL)
+    cv.disc(x + 196, 254, 4, WHITE)
+    cv.disc(x + 270, 210, 13, MOON)
+    cv.fill(x + 267, 208, x + 270, 209, WHITE)
+    cv.fill(x + 268, 207, x + 269, 210, WHITE)
+    cv.frame(x, 188, x + 300, 292, INK, 1)
 
 
-def draw_icon(c, kind, x, y, s, color):
-    """Small white pictogram inside a coloured square (mid stories)."""
-    if kind == "tower":
-        c.fill_rect(x + s // 2 - 5, y + 6, 10, s - 12, color)
-        c.polygon([(x + s // 2 - 7, y + 6), (x + s // 2 + 7, y + 6),
-                   (x + s // 2, y + 1)], color)
-        c.fill_rect(x + 4, y + s - 8, s - 8, 4, color)
-    elif kind == "chart":
-        c.line(x + 5, y + s - 6, x + s - 5, y + s - 6, color, 2)
-        c.line(x + 5, y + s - 6, x + 5, y + 6, color, 2)
-        c.line(x + 8, y + 12, x + s // 2, y + 20, color, 3)
-        c.line(x + s // 2, y + 20, x + s - 8, y + s - 12, color, 3)
-    elif kind == "pin":
-        c.disc(x + s // 2, y + s // 2 - 3, 9, color)
-        c.polygon([(x + s // 2 - 8, y + s // 2 + 2), (x + s // 2 + 8, y + s // 2 + 2),
-                   (x + s // 2, y + s - 4)], color)
-        c.disc(x + s // 2, y + s // 2 - 3, 3, PAPER)
+# -------------------------------------------------------------- mid icons --
+
+def draw_icon(cv, ix, iy, kind, bg):
+    """A 44x44 coloured square with a white pictogram."""
+    cv.fill(ix, iy, ix + 44, iy + 44, bg)
+    cx, cy = ix + 22, iy + 22
+    if kind == "burst":
+        cv.star(cx, cy, 15, 6.5, 12, WHITE)
     elif kind == "leaf":
-        c.ellipse(x + s // 2, y + s // 2, 13, 8, color)
-        c.line(x + 6, y + s - 8, x + s - 6, y + 8, PAPER, 2)
-    elif kind == "ship":
-        c.polygon([(x + 4, y + s - 12), (x + s - 4, y + s - 12),
-                   (x + s - 10, y + s - 4), (x + 10, y + s - 4)], color)
-        c.fill_rect(x + s // 2 - 3, y + 6, 6, 12, color)
-        c.disc(x + s // 2 + 8, y + 8, 3, (255, 150, 40))
-    elif kind == "cross":
-        c.fill_rect(x + s // 2 - 4, y + 5, 8, s - 10, color)
-        c.fill_rect(x + 5, y + s // 2 - 4, s - 10, 8, color)
-    elif kind == "burst":
-        pts = []
-        for i in range(16):
-            ang = i * math.pi / 8
-            rr = 15 if i % 2 == 0 else 7
-            pts.append((int(x + s // 2 + rr * math.cos(ang)),
-                        int(y + s // 2 + rr * math.sin(ang))))
-        c.polygon(pts, color)
-        c.disc(x + s // 2, y + s // 2, 4, PAPER)
+        cv.ellipse_rot(cx, cy - 1, 13, 6, -17, WHITE)
+        cv.thick_line(ix + 10, iy + 27, ix + 34, iy + 17, WHITE, 2)
     elif kind == "chip":
-        c.fill_rect(x + 8, y + 8, s - 16, s - 16, color)
-        c.frame(x + 8, y + 8, s - 16, s - 16, PAPER, 2)
-        for i in range(3):
-            c.fill_rect(x + 4 + i * 12, y + 2, 4, 6, color)
-            c.fill_rect(x + 4 + i * 12, y + s - 8, 4, 6, color)
+        cv.fill(ix + 11, iy + 11, ix + 33, iy + 33, WHITE)
+        for dx in (5, 17, 29):
+            cv.fill(ix + dx, iy + 3, ix + dx + 4, iy + 9, WHITE)
+            cv.fill(ix + dx, iy + 35, ix + dx + 4, iy + 41, WHITE)
     elif kind == "game":
-        c.fill_rect(x + 5, y + 10, s - 10, s - 20, color)
-        c.disc(x + 12, y + s // 2, 4, PAPER)
-        c.disc(x + s - 12, y + s // 2, 4, PAPER)
-        c.fill_rect(x + 10, y + s // 2 - 2, 8, 4, PAPER)
+        cv.fill(ix + 6, iy + 11, ix + 38, iy + 33, WHITE)
+        cv.disc(ix + 13, iy + 22, 4, PAPER)
+        cv.disc(ix + 31, iy + 22, 4, PAPER)
+    elif kind == "ship":
+        cv.fill(ix + 19, iy + 7, ix + 25, iy + 19, WHITE)
+        cv.disc(ix + 29, iy + 9, 3, ORANGE)
+        cv.polygon([(ix + 5, iy + 31), (ix + 42, iy + 31),
+                    (ix + 36, iy + 39), (ix + 10, iy + 39)], WHITE)
+    elif kind == "pin":
+        cv.disc(cx, cy - 4, 10, WHITE)
+        cv.polygon([(cx - 9, cy), (cx + 9, cy), (cx, cy + 16)], WHITE)
+        cv.disc(cx, cy - 4, 3, bg)
     elif kind == "sigma":
-        c.line(x + s - 8, y + 8, x + 8, y + 8, color, 4)
-        c.line(x + 8, y + 8, x + s - 8, y + s // 2, color, 4)
-        c.line(x + s - 8, y + s // 2, x + 8, y + s - 8, color, 4)
-        c.line(x + 8, y + s - 8, x + s - 8, y + s - 8, color, 4)
+        cv.fill(ix + 7, iy + 7, ix + 37, iy + 11, WHITE)
+        cv.fill(ix + 7, iy + 33, ix + 37, iy + 37, WHITE)
+        cv.polygon([(ix + 8, iy + 11), (ix + 19, iy + 11),
+                    (ix + 37, iy + 22), (ix + 29, iy + 22)], WHITE)
+        cv.polygon([(ix + 29, iy + 22), (ix + 37, iy + 22),
+                    (ix + 17, iy + 33), (ix + 9, iy + 33)], WHITE)
+    elif kind == "cross":
+        cv.fill(ix + 18, iy + 6, ix + 26, iy + 38, WHITE)
+        cv.fill(ix + 6, iy + 18, ix + 38, iy + 26, WHITE)
 
 
-# ---------------------------------------------------------------- dotted map
+# --------------------------------------------------------------- content ----
 
-def draw_dotted_map(c, x, y, w, h, dot_color, story_dots):
-    """Land cells as dots; story_dots is a list of (lon, lat, color, r)."""
-    bits = base64.b64decode(MAP_BITS)
-    step_x = w / MAP_W
-    step_y = h / MAP_H
-    for row in range(MAP_H):
-        for col in range(MAP_W):
-            i = row * MAP_W + col
-            if (bits[i // 8] >> (i % 8)) & 1:
-                cx = int(x + (col + 0.5) * step_x)
-                cy = int(y + (row + 0.5) * step_y)
-                c.disc(cx, cy, 2, dot_color)
-    for lon, lat, color, r in story_dots:
-        px = int(x + (lon + 180.0) / 360.0 * w)
-        py = int(y + (84.0 - lat) / (84.0 + 58.0) * h)
-        c.ring(px, py, r + 3, color, 2)
-        c.disc(px, py, r, color)
+MASTHEAD = "SATURDAY 21 NOVEMBER 2026"
+SUBHEAD = ("The world in one day \u00b7 every story here happened, or was "
+           "first reported, on this Saturday.")
 
-# ---------------------------------------------------------------- stories
+TIMELINE = [("00:48", "Tax on AI centres"),
+            ("05:40", "Riyadh under fire"),
+            ("06:32", "Killer-robot rules"),
+            ("06:44", "French police law"),
+            ("15:35", "Cartel boss seized")]
 
-HERO = [
-    {
-        "region": "North America",
-        "kicker": "MARKETS - NEW YORK",
-        "headline": "Markets fall\ninto correction",
-        "summary": "S&P -3.7%, Nikkei -5.1%;\nNasdaq wipes out 2026 gains.",
-        "source": "OneTurn - BBC",
-        "art": "markets",
-    },
-    {
-        "region": "North America",
-        "kicker": "JUSTICE - MEXICO",
-        "headline": "Mexico seizes\ncartel boss",
-        "summary": "El Chapo Isidro held;\nFBI most-wanted, gun battles.",
-        "source": "AP - BBC",
-        "art": "cartel",
-    },
-    {
-        "region": "Europe",
-        "kicker": "WAR - UKRAINE",
-        "headline": "Missile hits\nhis hometown",
-        "summary": "2 killed, 60 hurt;\nKryvyi Rih hit; Poland too.",
-        "source": "AP - CBC",
-        "art": "kryvyi",
-    },
+HEROES = [
+    {"art": "markets", "kicker": "MARKETS - NEW YORK", "color": RED,
+     "headline": ["Markets fall", "into correction"],
+     "summary": ["S&P -3.7%, Nikkei -5.1%;", "Nasdaq wipes out 2026 gains."],
+     "source": "OneTurn - BBC"},
+    {"art": "wanted", "kicker": "JUSTICE - MEXICO", "color": RED,
+     "headline": ["Mexico seizes", "cartel boss"],
+     "summary": ["El Chapo Isidro held;", "FBI most-wanted, gun battles."],
+     "source": "AP - BBC"},
+    {"art": "skyline", "kicker": "WAR - UKRAINE", "color": RED,
+     "headline": ["Missile hits", "his hometown"],
+     "summary": ["2 killed, 60 hurt;", "Kryvyi Rih hit; Poland too."],
+     "source": "AP - CBC"},
 ]
 
-MID = [
-    {
-        "region": "Middle East",
-        "kicker": "MIDDLE EAST - RIYADH",
-        "headline": "Houthi strikes\non Riyadh",
-        "summary": "3 missiles at Riyadh; 71 strikes in reply.",
-        "icon": "burst", "color": RED,
-    },
-    {
-        "region": "Europe",
-        "kicker": "CLIMATE - COP31",
-        "headline": "COP31 talks\nrun overtime",
-        "summary": "Deadline passes; fuel wording disputed.",
-        "icon": "leaf", "color": GREEN,
-    },
-    {
-        "region": "North America",
-        "kicker": "CYBER - WASHINGTON",
-        "headline": "FBI records\nhacked",
-        "summary": "FBI crime database reportedly hacked.",
-        "icon": "chip", "color": BLUE,
-    },
-    {
-        "region": "Asia",
-        "kicker": "GAMES - WORLDWIDE",
-        "headline": "GTA VI: $3.8bn\nin one day",
-        "summary": "$3.8bn in a day, a record launch.",
-        "icon": "game", "color": GOLD,
-    },
-    {
-        "region": "Middle East",
-        "kicker": "MIDEAST - HORMUZ",
-        "headline": "Tanker attacks\nin Hormuz",
-        "summary": "Six tanker attacks in a week; talks stalled.",
-        "icon": "ship", "color": BLUE,
-    },
-    {
-        "region": "Europe",
-        "kicker": "EUROPE - DENMARK",
-        "headline": "Denmark expels\nenvoy",
-        "summary": "Attache expelled over plot to kill a rapper.",
-        "icon": "pin", "color": PURPLE,
-    },
-    {
-        "region": "North America",
-        "kicker": "SCIENCE - MATHS",
-        "headline": "AI claims\nRiemann proof",
-        "summary": "Claude said to prove maths' greatest riddle.",
-        "icon": "sigma", "color": PURPLE,
-    },
-    {
-        "region": "North America",
-        "kicker": "HEALTH - VIRGINIA",
-        "headline": "US loses\nmeasles status",
-        "summary": "First child death in Virginia; status lost.",
-        "icon": "cross", "color": GREEN,
-    },
+MIDS = [
+    {"kicker": "MIDDLE EAST - RIYADH", "color": RED, "icon": "burst",
+     "headline": ["Houthi strikes", "on Riyadh"],
+     "summary": ["3 missiles at Riyadh;", "71 strikes in reply."]},
+    {"kicker": "CLIMATE - COP31", "color": GREEN, "icon": "leaf",
+     "headline": ["COP31 talks", "run overtime"],
+     "summary": ["Deadline passes; fuel", "wording disputed."]},
+    {"kicker": "CYBER - WASHINGTON", "color": BLUE, "icon": "chip",
+     "headline": ["FBI records", "hacked"],
+     "summary": ["FBI crime database", "reportedly hacked."]},
+    {"kicker": "GAMES - WORLDWIDE", "color": GOLD, "icon": "game",
+     "headline": ["GTA VI: $3.8bn", "in one day"],
+     "summary": ["$3.8bn in a day, a", "record launch."]},
+    {"kicker": "MIDEAST - HORMUZ", "color": BLUE, "icon": "ship",
+     "headline": ["Tanker attacks", "in Hormuz"],
+     "summary": ["Six tanker attacks in a", "week; talks stalled."]},
+    {"kicker": "EUROPE - DENMARK", "color": PURPLE, "icon": "pin",
+     "headline": ["Denmark expels", "envoy"],
+     "summary": ["Attache expelled over", "plot to kill a rapper."]},
+    {"kicker": "SCIENCE - MATHS", "color": PURPLE, "icon": "sigma",
+     "headline": ["AI claims", "Riemann proof"],
+     "summary": ["Claude said to prove", "maths' greatest riddle."]},
+    {"kicker": "HEALTH - VIRGINIA", "color": GREEN, "icon": "cross",
+     "headline": ["US loses", "measles status"],
+     "summary": ["First child death in", "Virginia; status lost."]},
 ]
 
-ALSO = [
-    ("North America", "Trump threatens tax on data centres"),
-    ("North America", "Mamdani: close Rikers Island by 2032"),
-    ("North America", "Palisades fire arsonist convicted"),
-    ("North America", "Indian man jailed over Sikh plot"),
-    ("North America", "Bayer Roundup deal: $7.25bn"),
-    ("North America", "Harden passes Kobe on 50-point list"),
-    ("South America", "Bolsonaro in hospital, surgery looms"),
-    ("South America", "Magnitude 6.7 quake shakes Peru"),
-    ("South America", "Dengue cases down 69% in Brazil trial"),
-    ("South America", "Isolated Awa approach Brazil outpost"),
-    ("Europe", "UK and EU sign three Brexit deals"),
-    ("Europe", "EU signs Indonesia trade deal"),
-    ("Europe", "EU eyes 3% tax on Big Tech"),
-    ("Europe", "France jails police over Zecler beating"),
-    ("Europe", "Spain votes on Nov 29 as PP leads"),
-    ("Europe", "Estonia to shut Russia border Dec 1"),
-    ("Europe", "England beat All Blacks 37-12"),
-    ("Europe", "BepiColombo enters Mercury orbit"),
-    ("Middle East", "Basra power fire kills four"),
-    ("Middle East", "Iraq strikes deal with Kataib Hezbollah"),
-    ("Middle East", "Israeli strike kills 3 in Gaza aid van"),
-    ("Middle East", "Saudi, Japan agree oil stockpile deal"),
-    ("Africa", "Nigeria boat sinks, 300 missing"),
-    ("Africa", "700,000 displaced in south Ethiopia"),
-    ("Africa", "Tanzania jails opposition leader Lissu"),
-    ("Africa", "Uganda curbs travel over Ebola"),
-    ("Asia", "Japan sidelined as China hosts APEC"),
-    ("Asia", "Seoul moves to impeach chief justice"),
-    ("Asia", "BTS win five awards at MAMA"),
-    ("Oceania", "US sells seabed leases off Samoa"),
-    ("Oceania", "Melbourne teen ran arsons via Signal"),
+ALSO_LEFT = [
+    ("Trump threatens tax on data centres", BLUE),
+    ("Mamdani: close Rikers Island by 2032", BLUE),
+    ("Palisades fire arsonist convicted", BLUE),
+    ("Indian man jailed over Sikh plot", BLUE),
+    ("Bayer Roundup deal: $7.25bn", BLUE),
+    ("Harden passes Kobe on 50-point list", BLUE),
+    ("Bolsonaro in hospital, surgery looms", BROWN),
+    ("Magnitude 6.7 quake shakes Peru", BROWN),
+    ("Dengue cases down 69% in Brazil trial", BROWN),
+    ("Isolated Awa approach Brazil outpost", BROWN),
+    ("UK and EU sign three Brexit deals", PURPLE),
+    ("EU signs Indonesia trade deal", PURPLE),
+    ("EU eyes 3% tax on Big Tech", PURPLE),
+    ("France jails police over Zecler beating", PURPLE),
+    ("Spain votes on Nov 29 as PP leads", PURPLE),
+    ("Estonia to shut Russia border Dec 1", PURPLE),
 ]
 
-TIMELINE = [
-    ("00:48", "Tax on AI centres"),
-    ("05:40", "Riyadh under fire"),
-    ("06:32", "Killer-robot rules"),
-    ("06:44", "French police law"),
-    ("15:35", "Cartel boss seized"),
+ALSO_RIGHT = [
+    ("England beat All Blacks 37-12", PURPLE),
+    ("BepiColombo enters Mercury orbit", PURPLE),
+    ("Basra power fire kills four", RED),
+    ("Iraq strikes deal with Kataib Hezbollah", RED),
+    ("Israeli strike kills 3 in Gaza aid van", RED),
+    ("Saudi, Japan agree oil stockpile deal", RED),
+    ("Nigeria boat sinks, 300 missing", GREEN),
+    ("700,000 displaced in south Ethiopia", GREEN),
+    ("Tanzania jails opposition leader Lissu", GREEN),
+    ("Uganda curbs travel over Ebola", GREEN),
+    ("Japan sidelined as China hosts APEC", GOLD),
+    ("Seoul moves to impeach chief justice", GOLD),
+    ("BTS win five awards at MAMA", GOLD),
+    ("US sells seabed leases off Samoa", TEAL),
+    ("Melbourne teen ran arsons via Signal", TEAL),
 ]
 
-# Story dots on the map: (lon, lat, color, radius)
-MAP_DOTS = [
-    (33.4, 48.0, RED, 4),       # Kryvyi Rih
-    (-108.5, 25.6, RED, 4),     # Sinaloa
-    (-74.0, 40.7, BLUE, 3),     # New York
-    (46.7, 24.7, RED, 3),       # Riyadh
-    (56.5, 26.5, RED, 3),       # Hormuz
-    (4.35, 50.85, PURPLE, 3),   # Brussels
-    (6.1, 46.2, GOLD, 3),       # Geneva
-    (-47.9, -15.8, BROWN, 3),   # Brasilia
-    (145.0, -37.8, TEAL, 3),    # Melbourne
-    (139.7, 35.7, GOLD, 3),     # Tokyo
-]
+REGION_COUNTS_LEFT = [("North America", 11, BLUE), ("South America", 4, BROWN),
+                      ("Europe", 11, PURPLE), ("Middle East", 6, RED)]
+REGION_COUNTS_RIGHT = [("Africa", 4, GREEN), ("Asia", 4, GOLD),
+                       ("Oceania", 2, TEAL)]
 
-REGION_COLORS = {
-    "North America": BLUE,
-    "South America": BROWN,
-    "Europe": PURPLE,
-    "Middle East": RED,
-    "Africa": GREEN,
-    "Asia": GOLD,
-    "Oceania": TEAL,
-}
-REGION_ORDER = ["North America", "South America", "Europe",
-                "Middle East", "Africa", "Asia", "Oceania"]
-
-
-def story_count():
-    return len(HERO) + len(MID) + len(ALSO)
-
-
-def region_counts():
-    counts = {r: 0 for r in REGION_ORDER}
-    for s in HERO + MID:
-        counts[s["region"]] += 1
-    for region, _ in ALSO:
-        counts[region] += 1
-    return counts
-
-# ---------------------------------------------------------------- compose
-
-def compose():
-    c = Canvas(W, H, PAPER)
-    mx, cw = 26, 972
-
-    # Top bar
-    c.fill_rect(0, 0, W, 30, INK)
-    c.draw_text("sans_bold_13", mx + 2, 8, "ONE DAY OF WORLD NEWS", WHITE)
-    total = story_count()
-    right = "%d STORIES - 7 REGIONS - ALL FROM THIS SATURDAY" % total
-    c.draw_text("sans_bold_13", W - mx - 2, 8, right, WHITE, align="right")
-
-    # Masthead
-    date_line = "SATURDAY 21 NOVEMBER 2026"
-    c.draw_text("serif_bold_56", W // 2, 36, date_line, INK, align="center",
-                tracking=-3)
-    c.draw_text("serif_19", W // 2, 96,
-                "The world in one day - every story here happened, or was "
-                "first reported, on this Saturday.",
-                GREY, align="center")
-    c.hline(mx, 122, cw, INK, 3)
-    c.hline(mx, 127, cw, INK, 1)
-
-    # Timeline strip: one line per event, time + label
-    ty = 136
-    c.draw_text("sans_bold_13", mx, ty, "THE DAY IN UTC", RED)
-    c.draw_text("sans_bold_13", W - mx, ty, "WHEN THE NEWS BROKE", GREY,
-                align="right")
-    c.hline(mx, ty + 22, cw, INK, 2)
-    slot = cw / len(TIMELINE)
-    for i, (t, label) in enumerate(TIMELINE):
-        cx = int(mx + slot * i + slot / 2)
-        c.disc(cx, ty + 22, 4, RED)
-        c.draw_text("sans_15", cx, ty + 30, "%s  %s" % (t, label), INK,
-                    align="center")
-
-    # Hero row
-    hy, hh = 188, 104
-    col_w, gap = 300, 36
-    for i, story in enumerate(HERO):
-        x = mx + i * (col_w + gap)
-        art = {"markets": hero_markets, "cartel": hero_cartel,
-               "kryvyi": hero_kryvyi}[story["art"]]
-        art(c, x, hy, col_w, hh)
-        c.frame(x, hy, col_w, hh, INK, 1)
-        y = hy + hh + 8
-        c.draw_text("sans_bold_13", x, y, story["kicker"], RED)
-        y += 17
-        y = c.draw_wrapped("serif_bold_34", x, y, story["headline"], INK,
-                           col_w, leading=38)
-        y += 3
-        y = c.draw_wrapped("serif_19", x, y, story["summary"], INK, col_w,
-                           leading=22)
-        c.draw_text("sans_15", x, y + 1, story["source"], GREY)
-
-    c.hline(mx, 462, cw, INK, 2)
-
-    # Mid rows: two rows of four
-    my = 472
-    mcol_w, mgap = 225, 24
-    for row in range(2):
-        for col in range(4):
-            story = MID[row * 4 + col]
-            x = mx + col * (mcol_w + mgap)
-            y = my + row * 112
-            c.fill_rect(x, y + 2, 44, 44, story["color"])
-            draw_icon(c, story["icon"], x + 1, y + 3, 42, WHITE)
-            tx = x + 52
-            c.draw_text("sans_bold_13", tx, y, story["kicker"],
-                        story["color"])
-            y2 = c.draw_wrapped("serif_19", tx, y + 15,
-                                story["headline"], INK, mcol_w - 52,
-                                leading=22)
-            c.draw_wrapped("sans_15", tx, y2 + 2, story["summary"], GREY,
-                           mcol_w - 52, leading=17)
-
-    c.hline(mx, 702, cw, INK, 2)
-
-    # Bottom left: map + region counts + date check
-    by = 712
-    c.draw_text("sans_bold_13", mx, by, "WHERE IT HAPPENED", INK)
-    map_x, map_y, map_w, map_h = mx, by + 20, 330, 120
-    c.frame(map_x - 4, map_y - 4, map_w + 8, map_h + 8, INK, 1)
-    draw_dotted_map(c, map_x, map_y, map_w, map_h, (150, 140, 115), MAP_DOTS)
-    counts = region_counts()
-    ly = map_y + map_h + 10
-    for j, region in enumerate(REGION_ORDER):
-        lx = mx + (j // 4) * 170
-        ry = ly + (j % 4) * 15
-        c.disc(lx + 6, ry + 6, 4, REGION_COLORS[region])
-        c.draw_text("sans_15", lx + 16, ry,
-                    "%s - %d" % (region, counts[region]), INK)
-    dy = ly + 4 * 15 + 8
-    c.draw_wrapped("sans_15", mx, dy,
-                   "DATE CHECK: the Shenzhen summit, Kyiv strikes and ICJ "
+DATE_CHECK_TEXT = ("DATE CHECK: the Shenzhen summit, Kyiv strikes and ICJ "
                    "ruling were 20 November news, so they are not listed. "
                    "Every story here happened, or was first reported, on "
-                   "Saturday 21 November.",
-                   INK, map_w, leading=17)
+                   "Saturday 21 November.")
 
-    # Bottom right: also list
-    rx, rw = 374, 624
-    c.draw_text("sans_bold_13", rx, by, "ALSO ON SATURDAY 21 NOVEMBER", INK)
-    col2_w = (rw - 18) // 2
-    per_col = 16
-    for i, (region, text) in enumerate(ALSO):
-        col = i // per_col
-        row = i % per_col
-        x = rx + col * (col2_w + 18)
-        y = by + 20 + row * 16
-        c.fill_rect(x, y + 4, 5, 5, REGION_COLORS[region])
-        c.draw_text("sans_15", x + 11, y, text, INK)
+FOOTER = ("Sources: OneTurn, SCMP, AP, BBC, Reuters \u00b7 Drawn by a "
+          "program; no photo, no network.")
 
-    # Footer
-    c.draw_text("sans_bold_13", W // 2, 1010,
-                "Sources: OneTurn, SCMP, AP, BBC, Reuters - "
-                "Drawn by a program; no photo, no network.",
-                GREY, align="center")
-    return c
+
+# ---------------------------------------------------------------- layout ---
+
+def draw_top(cv):
+    cv.fill(0, 0, WIDTH, 30, INK)
+    draw_text(cv, 28, 21, "sans_bold_13", "ONE DAY OF WORLD NEWS", WHITE)
+    right = "42 STORIES \u00b7 7 REGIONS \u00b7 ALL FROM THIS SATURDAY"
+    draw_text(cv, 996 - text_width("sans_bold_13", right), 21,
+              "sans_bold_13", right, WHITE)
+    w = text_width("serif_bold_56", MASTHEAD, -3)
+    draw_text(cv, (WIDTH - w) // 2, 89, "serif_bold_56", MASTHEAD, INK, -3)
+    w = text_width("serif_19", SUBHEAD)
+    draw_text(cv, (WIDTH - w) // 2, 114, "serif_19", SUBHEAD, GREY)
+    cv.fill(LEFT, 122, RIGHT, 125, INK)
+    cv.fill(LEFT, 127, RIGHT, 128, INK)
+
+
+def draw_timeline(cv):
+    draw_text(cv, LEFT, 149, "sans_bold_13", "THE DAY IN UTC", RED)
+    label = "WHEN THE NEWS BROKE"
+    draw_text(cv, RIGHT - text_width("sans_bold_13", label), 149,
+              "sans_bold_13", label, GREY)
+    cv.fill(LEFT, 158, RIGHT, 160, INK)
+    dots = [123, 317, 512, 706, 900]
+    for cx in dots:
+        cv.disc(cx, 158, 4, RED)
+    for (time, text), dot in zip(TIMELINE, dots):
+        total = (text_width("sans_15", time) + 10
+                 + text_width("sans_15", text))
+        sx = dot - total // 2
+        end = draw_text(cv, sx, 180, "sans_15", time, INK)
+        draw_text(cv, end + 10, 180, "sans_15", text, INK)
+
+
+def draw_heroes(cv):
+    art_fns = {"markets": art_markets, "wanted": art_wanted,
+               "skyline": art_skyline}
+    for i, hero in enumerate(HEROES):
+        x = LEFT + i * 336
+        art_fns[hero["art"]](cv, x)
+        draw_text(cv, x, 313, "sans_bold_13", hero["kicker"], hero["color"])
+        for j, line in enumerate(hero["headline"]):
+            draw_text(cv, x, 349 + j * 38, "serif_bold_34", line, INK)
+        for j, line in enumerate(hero["summary"]):
+            draw_text(cv, x, 414 + j * 22, "serif_19", line, INK)
+        draw_text(cv, x, 455, "sans_15", hero["source"], GREY)
+
+
+def draw_mids(cv):
+    for i, mid in enumerate(MIDS):
+        ix = [26, 275, 524, 773][i % 4]
+        iy = 474 if i < 4 else 586
+        tx = ix + 52
+        draw_icon(cv, ix, iy, mid["icon"], mid["color"])
+        draw_text(cv, tx, iy + 11, "sans_bold_13", mid["kicker"],
+                  mid["color"])
+        for j, line in enumerate(mid["headline"]):
+            draw_text(cv, tx, iy + 31 + j * 22, "serif_19", line, INK)
+        for j, line in enumerate(mid["summary"]):
+            draw_text(cv, tx, iy + 73 + j * 17, "sans_15", line, GREY)
+
+
+def draw_bottom(cv):
+    draw_text(cv, LEFT, 725, "sans_bold_13", "WHERE IT HAPPENED", INK)
+    draw_text(cv, 374, 725, "sans_bold_13",
+              "ALSO ON SATURDAY 21 NOVEMBER", INK)
+    draw_map(cv, land_cells())
+    for col, counts, dot_x, text_x in (
+            (0, REGION_COUNTS_LEFT, 32, 42),
+            (1, REGION_COUNTS_RIGHT, 202, 212)):
+        for i, (name, n, color) in enumerate(counts):
+            baseline = 876 + i * 15
+            cv.disc(dot_x, baseline - 8, 4, color)
+            draw_text(cv, text_x, baseline, "sans_15",
+                      "%s - %d" % (name, n), INK)
+    lines = wrap_lines("sans_15", DATE_CHECK_TEXT, 334)
+    for i, line in enumerate(lines):
+        baseline = 944 + i * 17
+        draw_text(cv, LEFT, baseline, "sans_15", line, INK)
+    for i, (text, color) in enumerate(ALSO_LEFT):
+        baseline = 746 + i * 16
+        cv.fill(374, baseline - 10, 379, baseline - 5, color)
+        draw_text(cv, 385, baseline, "sans_15", text, INK)
+    for i, (text, color) in enumerate(ALSO_RIGHT):
+        baseline = 746 + i * 16
+        cv.fill(695, baseline - 10, 700, baseline - 5, color)
+        draw_text(cv, 706, baseline, "sans_15", text, INK)
+
+
+def draw_page(cv):
+    draw_top(cv)
+    draw_timeline(cv)
+    draw_heroes(cv)
+    cv.fill(LEFT, 462, RIGHT, 464, INK)
+    draw_mids(cv)
+    cv.fill(LEFT, 702, RIGHT, 704, INK)
+    draw_bottom(cv)
+    w = text_width("sans_bold_13", FOOTER)
+    draw_text(cv, (WIDTH - w + 1) // 2, 1023, "sans_bold_13", FOOTER, GREY)
+
 
 def main():
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    cv = Canvas(WIDTH, HEIGHT, PAPER)
+    draw_page(cv)
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
     os.makedirs(out_dir, exist_ok=True)
-    canvas = compose()
     path = os.path.join(out_dir, "entry.png")
-    size = write_png(path, canvas)
-    print("wrote %s (%d bytes, %dx%d)" % (path, size, W, H))
+    data = cv.png()
+    with open(path, "wb") as f:
+        f.write(data)
+    print("wrote %s (%d bytes, 1024x1024)" % (path, len(data)))
 
 
 if __name__ == "__main__":
