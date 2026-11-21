@@ -1,5 +1,5 @@
 # Font data: DejaVu glyph bitmaps (4-bit grayscale), zlib+base64.
-# Extracted on this machine by extract_assets.py from the system
+# Regenerated in-session by gen_fonts.py from the system
 # DejaVu fonts (freely redistributable, Bitstream Vera licence).
 # Data only; main.py decodes it with its own unpacker.
 FONTS = {
